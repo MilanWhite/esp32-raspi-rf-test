@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
+from time import sleep
+from binascii import hexlify
 
+from cc1101.config import RXConfig, Modulation
 from cc1101 import CC1101
-import time
 
-# -------- CONFIG --------
-SPI_BUS = 0          # SPI bus 0
-SPI_DEVICE = 0       # CE0 -> /dev/spidev0.0
-FREQ_MHZ = 915.0     # MUST match ESP32
-# ------------------------
+DEVICE = "/dev/cc1101.0.0"
 
-# IMPORTANT:
-# CC1101(bus, device)
-radio = CC1101(SPI_BUS, SPI_DEVICE)
+# MUST match your ESP32 radio settings
+FREQUENCY_MHZ = 915        # 433 / 868 / 915
+MODULATION = Modulation.FSK_2
+BAUD_KBAUD = 1             # data rate in kBaud
+PACKET_LENGTH = 64         # fixed number of bytes the driver will read per packet
+SYNC_WORD = 0x0000         # 0x0000 disables sync word (see docs)
 
-radio.reset()
-radio.set_frequency_mhz(FREQ_MHZ)
-radio.set_crc(True)
-radio.set_packet_mode()
-radio.rx()
+rx_config = RXConfig.new(
+    frequency=FREQUENCY_MHZ,
+    modulation=MODULATION,
+    baud_rate=BAUD_KBAUD,
+    sync_word=SYNC_WORD,
+    packet_length=PACKET_LENGTH,
+)
 
-print("CC1101 RX ready")
+radio = CC1101(DEVICE, rx_config, blocking=True)
+
+print("Listening on {} MHz, {}, {} kBaud, len={}".format(
+    FREQUENCY_MHZ, MODULATION.name, BAUD_KBAUD, PACKET_LENGTH
+))
 
 while True:
-    if radio.packet_available():
-        pkt = radio.receive_packet()
-        if pkt:
-            try:
-                print("RX:", pkt.decode("utf-8", errors="ignore"))
-            except Exception:
-                print("RX raw:", pkt)
-    time.sleep(0.05)
+    packets = radio.receive()
+    for p in packets:
+        # show hex always
+        print("RX hex:", hexlify(p).decode("ascii"))
+
+        # also try ASCII (strip trailing nulls)
+        try:
+            s = p.split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
+            if s:
+                print("RX txt:", s)
+        except Exception:
+            pass
+
+    sleep(0.05)
