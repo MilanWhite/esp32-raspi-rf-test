@@ -195,6 +195,14 @@ def main():
         radio.apply_config_like_common_senddata(mhz=915.0)
         print("CC1101 RX ready on 915.0 MHz (polling RXFIFO). Ctrl+C to stop.")
 
+        # Prove SPI+CS works by reading CC1101 PARTNUM/VERSION (status regs 0x30/0x31)
+        try:
+            part = radio.read_reg(0x30)
+            ver  = radio.read_reg(0x31)
+            print("PARTNUM=0x%02X VERSION=0x%02X" % (part, ver), flush=True)
+        except Exception as e:
+            print("Could not read PARTNUM/VERSION:", e, flush=True)
+
         while True:
             pkt = radio.recv_packet()
             if pkt is None:
