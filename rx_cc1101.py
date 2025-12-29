@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-# Works on Python 3.7+
-# CC1101 RX (packet mode, variable length, CRC) over /dev/spidev0.0
+# CC1101 RX over /dev/spidev0.0 (userspace only). Python 3.7+.
 
 import time
 import spidev
 
-# ---- CC1101 register map (config regs) ----
+# ---- CC1101 register map ----
 IOCFG2    = 0x00
 IOCFG0    = 0x02
 PKTCTRL1  = 0x07
 PKTCTRL0  = 0x08
-ADDR      = 0x09
-CHANNR    = 0x0A
 FSCTRL1   = 0x0B
-FSCTRL0   = 0x0C
 FREQ2     = 0x0D
 FREQ1     = 0x0E
 FREQ0     = 0x0F
@@ -39,15 +35,14 @@ FSTEST    = 0x29
 TEST2     = 0x2C
 TEST1     = 0x2D
 TEST0     = 0x2E
-PATABLE   = 0x3E
 FIFO      = 0x3F
 
-# ---- CC1101 status regs ----
-LQI       = 0x33
-RSSI      = 0x34
+# ---- Status regs ----
+PARTNUM   = 0x30
+VERSION   = 0x31
 RXBYTES   = 0x3B
 
-# ---- CC1101 strobes ----
+# ---- Strobes ----
 SRES      = 0x30
 SIDLE     = 0x36
 SRX       = 0x34
@@ -58,23 +53,22 @@ READ_BURST  = 0xC0
 WRITE_BURST = 0x40
 
 def mhz_to_freq_regs(mhz, fxosc_hz=26_000_000):
-    # CC1101: Freq = (FREQ / 2^16) * fxosc
-    # => FREQ = mhz*1e6 * 2^16 / fxosc
-    freq_word = int((mhz * 1_000_000.0) * (1 << 16) / fxosc_hz)
-    return (freq_word >> 16) & 0xFF, (freq_word >> 8) & 0xFF, freq_word & 0xFF
+    w = int((mhz * 1_000_000.0) * (1 << 16) / fxosc_hz)
+    return (w >> 16) & 0xFF, (w >> 8) & 0xFF, w & 0xFF
+
+def is_status_reg(addr):
+    # CC1101 status regs are 0x30..0x3D (incl. PARTNUM/VERSION/RXBYTES)
+    return 0x30 <= addr <= 0x3D
 
 class CC1101:
-    def __init__(self, bus=0, dev=0, speed_hz=4_000_000):
+    def __init__(self, bus=0, dev=0, speed_hz=500_000):
         self.spi = spidev.SpiDev()
         self.spi.open(bus, dev)
         self.spi.max_speed_hz = speed_hz
         self.spi.mode = 0
 
     def close(self):
-        try:
-            self.spi.close()
-        except Exception:
-            pass
+        self.spi.close()
 
     def strobe(self, cmd):
         self.spi.xfer2([cmd])
@@ -83,60 +77,51 @@ class CC1101:
         self.spi.xfer2([addr & 0x3F, val & 0xFF])
 
     def read_reg(self, addr):
-        # Works for both config regs and status regs
-        resp = self.spi.xfer2([addr | READ_SINGLE, 0x00])
+        # Config regs: 0x80|addr
+        # Status regs: must use 0xC0|addr (burst bit set) even for 1 byte
+        cmd = (READ_BURST if is_status_reg(addr) else READ_SINGLE) | (addr & 0x3F)
+        resp = self.spi.xfer2([cmd, 0x00])
         return resp[1]
-
-    def write_burst(self, addr, data):
-        self.spi.xfer2([addr | WRITE_BURST] + [b & 0xFF for b in data])
 
     def read_burst(self, addr, n):
         resp = self.spi.xfer2([addr | READ_BURST] + [0x00] * n)
         return resp[1:]
 
     def reset(self):
-        # Typical userspace reset (CS handled by spidev)
         time.sleep(0.01)
         self.strobe(SRES)
         time.sleep(0.05)
 
-    def apply_config_like_common_senddata(self, mhz=915.0):
-        """
-        Packet mode (FIFO), variable length, CRC enabled, append status (RSSI/LQI).
-        Register choices here are aligned with common Arduino CC1101 "SendData()/ReceiveData()" setups.
-        """
+    def config_rx(self, mhz=915.0):
         self.reset()
 
-        # Base settings (these values match widely-used ELECHOUSE/SmartRC-style defaults)
-        self.write_reg(FSCTRL1, 0x06)
+        # Prove SPI+CS works
+        part = self.read_reg(PARTNUM)
+        ver  = self.read_reg(VERSION)
+        print("PARTNUM=0x%02X VERSION=0x%02X" % (part, ver), flush=True)
 
-        # GDOs: not required for this polling receiver, but set to common "packet" values
+        # Base (common stable defaults)
+        self.write_reg(FSCTRL1, 0x06)
         self.write_reg(IOCFG2, 0x0B)
         self.write_reg(IOCFG0, 0x06)
 
-        # Packet automation
-        self.write_reg(PKTCTRL1, 0x04)  # APPEND_STATUS = 1
-        self.write_reg(PKTCTRL0, 0x05)  # PKT_FORMAT=0, CRC_EN=1, LENGTH_CONFIG=1 (variable)
+        self.write_reg(PKTCTRL1, 0x04)  # APPEND_STATUS=1 (RSSI/LQI bytes appended)
+        # IMPORTANT: your ESP32 library has no setCRC(); assume CRC OFF for compatibility
+        self.write_reg(PKTCTRL0, 0x01)  # variable length, CRC OFF
 
-        self.write_reg(ADDR, 0x00)
-        self.write_reg(CHANNR, 0x00)
-
-        # Frequency
         f2, f1, f0 = mhz_to_freq_regs(mhz)
         self.write_reg(FREQ2, f2)
         self.write_reg(FREQ1, f1)
         self.write_reg(FREQ0, f0)
 
-        # Modem config (conservative, common stable settings)
-        # If your ESP32 library uses different modulation/data rate, these must match on both ends.
+        # Modem settings (2-FSK + sync). Must match ESP32 defaults to decode.
         self.write_reg(MDMCFG4, 0xCA)
         self.write_reg(MDMCFG3, 0x83)
-        self.write_reg(MDMCFG2, 0x13)  # 2-FSK + 16/16 sync
+        self.write_reg(MDMCFG2, 0x13)
         self.write_reg(MDMCFG1, 0x22)
         self.write_reg(MDMCFG0, 0xF8)
         self.write_reg(DEVIATN, 0x35)
 
-        # Front end / calibration / tests (common TI recommended-like)
         self.write_reg(FREND1, 0x56)
         self.write_reg(FREND0, 0x10)
         self.write_reg(MCSM0,  0x18)
@@ -154,65 +139,46 @@ class CC1101:
         self.write_reg(TEST1,  0x35)
         self.write_reg(TEST0,  0x09)
 
-        # Enter RX
         self.strobe(SIDLE)
         self.strobe(SFRX)
         self.strobe(SRX)
 
     def recv_packet(self):
-        # returns (payload_bytes, rssi_raw, lqi_raw, crc_ok) or None
         rxbytes = self.read_reg(RXBYTES) & 0x7F
         if rxbytes == 0:
             return None
 
-        # First byte in FIFO is payload length in variable-length mode
         length = self.read_burst(FIFO, 1)[0]
         if length == 0 or length > 61:
-            # Flush on nonsense; adjust 61 if you expect longer payloads
-            self.strobe(SIDLE)
-            self.strobe(SFRX)
-            self.strobe(SRX)
+            self.strobe(SIDLE); self.strobe(SFRX); self.strobe(SRX)
             return None
 
         payload = bytes(self.read_burst(FIFO, length))
 
-        # Two appended status bytes: RSSI, LQI/CRC_OK (CRC_OK is bit 7 of LQI)
-        status = self.read_burst(FIFO, 2)
-        rssi_raw = status[0]
-        lqi_raw = status[1]
-        crc_ok = (lqi_raw & 0x80) != 0
+        # appended status bytes (RSSI, LQI) still arrive if APPEND_STATUS=1
+        _status = self.read_burst(FIFO, 2)
 
-        # Flush RX FIFO + return to RX
-        self.strobe(SIDLE)
-        self.strobe(SFRX)
-        self.strobe(SRX)
-
-        return payload, rssi_raw, lqi_raw, crc_ok
+        self.strobe(SIDLE); self.strobe(SFRX); self.strobe(SRX)
+        return payload
 
 def main():
-    radio = CC1101(bus=0, dev=0, speed_hz=4_000_000)
+    radio = CC1101(bus=0, dev=0, speed_hz=500_000)  # CE0 -> /dev/spidev0.0
     try:
-        radio.apply_config_like_common_senddata(mhz=915.0)
-        print("CC1101 RX ready on 915.0 MHz (polling RXFIFO). Ctrl+C to stop.")
+        radio.config_rx(mhz=915.0)
+        print("CC1101 RX ready", flush=True)
 
-        # Prove SPI+CS works by reading CC1101 PARTNUM/VERSION (status regs 0x30/0x31)
-        try:
-            part = radio.read_reg(0x30)
-            ver  = radio.read_reg(0x31)
-            print("PARTNUM=0x%02X VERSION=0x%02X" % (part, ver), flush=True)
-        except Exception as e:
-            print("Could not read PARTNUM/VERSION:", e, flush=True)
-
+        last = time.time()
         while True:
             pkt = radio.recv_packet()
-            if pkt is None:
-                time.sleep(0.01)
-                continue
+            if pkt:
+                msg = pkt.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                print("RX:", msg, flush=True)
 
-            payload, rssi_raw, lqi_raw, crc_ok = pkt
-            # Your ESP32 sends a null-terminated C string, so decode safely:
-            msg = payload.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-            print("CRC_OK=%s RSSI_RAW=0x%02X LQI=0x%02X  MSG=%s" % (crc_ok, rssi_raw, lqi_raw, msg))
+            if time.time() - last > 2:
+                print("alive", flush=True)
+                last = time.time()
+
+            time.sleep(0.01)
     finally:
         radio.close()
 
