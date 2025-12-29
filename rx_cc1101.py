@@ -3,18 +3,15 @@
 from cc1101 import CC1101
 import time
 
-# ---------- CONFIG (must match ESP32) ----------
-FREQ_MHZ = 915.0        # 433.92 / 868.0 / 915.0
-SPI_BUS = 0
-SPI_DEVICE = 0          # CE0 -> /dev/spidev0.0
-GDO0_GPIO = 25          # optional but recommended
-# -----------------------------------------------
+# -------- CONFIG --------
+SPI_BUS = 0          # SPI bus 0
+SPI_DEVICE = 0       # CE0 -> /dev/spidev0.0
+FREQ_MHZ = 915.0     # MUST match ESP32
+# ------------------------
 
-radio = CC1101(
-    spi_bus=SPI_BUS,
-    spi_device=SPI_DEVICE,
-    gdo0=GDO0_GPIO
-)
+# IMPORTANT:
+# CC1101(bus, device)
+radio = CC1101(SPI_BUS, SPI_DEVICE)
 
 radio.reset()
 radio.set_frequency_mhz(FREQ_MHZ)
